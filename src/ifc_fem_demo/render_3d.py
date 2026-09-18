@@ -15,7 +15,8 @@ import numpy as np
 import pyvista as pv
 
 from ifc_fem_demo.ifc_geometry import world_mesh
-from ifc_fem_demo.structural import COMBO, AnalysisResult
+from ifc_fem_demo.render_spectra import CODE_COLOURS, SCENARIO_COLOUR
+from ifc_fem_demo.structural import AnalysisResult, LateralLoad
 
 pv.OFF_SCREEN = True
 
@@ -26,6 +27,7 @@ GROUND_COLOR = "#e4e2d8"
 TIMBER_COLOR = "#b98a5a"
 CONCRETE_COLOR = "#d6d2c6"
 GLASS_COLOR = "#a9d3ec"
+WIND_ARROW_COLOR = "#4a6fa5"
 
 # Rendered IFC classes and their look; openings and spatial elements are skipped.
 ELEMENT_STYLE = {
@@ -153,6 +155,13 @@ def add_structure(plotter: pv.Plotter, result: AnalysisResult, scale: float, cli
     plotter.add_mesh(bars, color=TIMBER_COLOR, ambient=0.25, diffuse=0.8, specular=0.1)
 
 
+def add_arrows(plotter: pv.Plotter, starts: np.ndarray, direction: np.ndarray, color: str, length: float = 0.8) -> None:
+    arrows = pv.PolyData(starts)
+    arrows["direction"] = np.tile(direction, (len(starts), 1))
+    glyphs = arrows.glyph(orient="direction", scale=False, factor=length, geom=pv.Arrow(shaft_radius=0.03, tip_radius=0.08, tip_length=0.3))
+    plotter.add_mesh(glyphs, color=color)
+
+
 def add_wind_arrows(plotter: pv.Plotter, result: AnalysisResult, wall_name: str) -> None:
     """A few arrows in front of the windward wall, so the lateral load is visible."""
     wall = next(panel for panel in result.structure.panels if panel.name == wall_name)
@@ -160,9 +169,23 @@ def add_wind_arrows(plotter: pv.Plotter, result: AnalysisResult, wall_name: str)
     if normal @ (result.mesh.points.mean(axis=0) - wall.surface.origin) < 0:
         normal = -normal
     starts = np.array([wall.surface.point(s, t) - 1.1 * normal for s in (0.2, 0.5, 0.8) for t in (0.3, 0.7)])
-    arrows = pv.PolyData(starts)
-    arrows["direction"] = np.tile(normal, (len(starts), 1))
-    plotter.add_mesh(arrows.glyph(orient="direction", scale=False, factor=0.8, geom=pv.Arrow(shaft_radius=0.03, tip_radius=0.08, tip_length=0.3)), color="#4a6fa5")
+    add_arrows(plotter, starts, normal, WIND_ARROW_COLOR)
+
+
+def add_inertia_arrows(plotter: pv.Plotter, result: AnalysisResult, load: LateralLoad) -> None:
+    """A row of arrows along the ground on the trailing side of the house, pointing with the inertial load."""
+    low, high = result.mesh.points.min(axis=0), result.mesh.points.max(axis=0)
+    across = 1 - load.axis
+    starts = np.empty((4, 3))
+    starts[:, load.axis] = low[load.axis] - 1.3
+    starts[:, across] = np.linspace(low[across] + 0.5, high[across] - 0.5, 4)
+    starts[:, 2] = low[2] + 0.4
+    add_arrows(plotter, starts, load.direction, inertia_arrow_colour(load), length=1.0)
+
+
+def inertia_arrow_colour(load: LateralLoad) -> str:
+    """The colour of the spectrum the load comes from in the spectra figure: blue for the scenario, orange for SIA 261."""
+    return CODE_COLOURS.get(load.level.removeprefix("SIA "), SCENARIO_COLOUR)
 
 
 def render_stress_comparison(
@@ -184,13 +207,56 @@ def render_stress_comparison(
         add_ground(plotter, low, high)
         frame_scene(plotter, low, high)
         plotter.add_text(
-            f"{result.case.replace('_', ' ')}: {COMBO} combination, deformation x{scale:g}\n"
+            f"{result.case.replace('_', ' ')}: {result.combo} combination, deformation x{scale:g}\n"
             f"peak {result.max_von_mises / 1e6:.2f} MPa in {result.max_stress_element}, "
             f"{result.corner_von_mises / 1e6:.2f} MPa at the window corners",
             position="upper_left",
             font_size=11,
             color="#333333",
         )
+    plotter.link_views()
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plotter.screenshot(str(output_path))
+    plotter.close()
+    print(f"Wrote {output_path}")
+    return output_path
+
+
+def render_seismic_comparison(
+    results: dict[str, AnalysisResult],
+    loads: list[LateralLoad],
+    output_path: Path = OUTPUT_DIR / "seismic_stress_comparison.png",
+) -> Path:
+    """One row per axis, one column per acceleration level; same colour and deformation scale throughout."""
+    axes = sorted({load.axis for load in loads})
+    per_axis = {axis: [load for load in loads if load.axis == axis] for axis in axes}
+    n_columns = max(len(column) for column in per_axis.values())
+    cases = [results[load.name] for load in loads]
+    scale = deformation_scale(cases)
+    clim = (0.0, max(r.max_von_mises for r in cases) / 1e6)
+
+    plotter = new_plotter(window_size=(576 * n_columns, 432 * len(axes)), shape=(len(axes), n_columns), border=False)
+    for row, axis in enumerate(axes):
+        for column, load in enumerate(per_axis[axis]):
+            result = results[load.name]
+            plotter.subplot(row, column)
+            last_panel = row == len(axes) - 1 and column == n_columns - 1
+            add_structure(plotter, result, scale, clim, show_scalar_bar=last_panel)
+            add_inertia_arrows(plotter, result, load)
+            low, high = result.mesh.points.min(axis=0), result.mesh.points.max(axis=0)
+            add_ground(plotter, low, high)
+            frame_scene(plotter, low, high)
+            plotter.add_text(
+                f"{load.name}: a = {load.acceleration:.2f} m/s2\n"
+                f"base shear {result.base_shear(load.axis) / 1e3:.0f} kN\n"
+                f"peak {result.max_von_mises / 1e6:.2f} MPa in {result.max_stress_element}",
+                position="upper_left",
+                font_size=9,
+                color="#333333",
+            )
+    plotter.subplot(0, 0)
+    plotter.add_text(f"deformation x{scale:g}, same scale in every panel", position="lower_left", font_size=9, color="#333333")
     plotter.link_views()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)

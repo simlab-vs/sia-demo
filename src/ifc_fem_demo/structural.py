@@ -10,12 +10,14 @@ window opening redistributes stress into its corners.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import ifcopenshell
 import ifcopenshell.util.element
 import numpy as np
+import scipy.sparse
 from Pynite import FEModel3D
 
 from ifc_fem_demo.add_window import TARGET_WALL_NAME, WINDOW_MODEL_PATH
@@ -229,7 +231,14 @@ class FeMesh:
     quad_panels: list[str]  # IFC element name each quad belongs to
     members: np.ndarray  # (n_members, 2) node indices
     member_names: list[str]
-    applied_force: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    applied_force: dict[str, np.ndarray] = field(default_factory=dict)  # resultant per load case, N
+
+    def combo_force(self, combo: str) -> np.ndarray:
+        factors = self.model.load_combos[combo].factors
+        return sum((factor * self.applied_force[case] for case, factor in factors.items()), np.zeros(3))
+
+    def free_nodes(self) -> np.ndarray:
+        return np.array([not self.model.nodes[name].support_DX for name in self.node_names])
 
     def displacements(self, combo: str = COMBO) -> np.ndarray:
         nodes = self.model.nodes
@@ -355,7 +364,19 @@ def _lump_on_nodes(mesh: FeMesh, node_indices, force: np.ndarray, case: str) -> 
         for direction, component in zip(("FX", "FY", "FZ"), share):
             if component != 0.0:
                 mesh.model.add_node_load(mesh.node_names[index], direction, float(component), case=case)
-    mesh.applied_force += force
+    mesh.applied_force[case] = mesh.applied_force.get(case, np.zeros(3)) + force
+
+
+def _panel_weights(mesh: FeMesh, structure: Structure, gravity: float):
+    """(quad, weight) for every shell element: density x g x thickness x area."""
+    panels = {panel.name: panel for panel in structure.panels}
+    for quad, panel_name in zip(mesh.quads, mesh.quad_panels):
+        panel = panels[panel_name]
+        yield quad, MATERIALS[panel.material].density * gravity * panel.thickness * _quad_area(mesh, quad)
+
+
+def _member_weight(mesh: FeMesh, gravity: float) -> float:
+    return sum(MATERIALS[m.material.name].density * gravity * m.section.A * m.L() for m in mesh.model.members.values())
 
 
 def _inward_normal(panel: Panel, house_centre: np.ndarray) -> np.ndarray:
@@ -368,13 +389,11 @@ def apply_loads(mesh: FeMesh, structure: Structure, loads: Loads) -> None:
     panels = {panel.name: panel for panel in structure.panels}
     down = np.array([0.0, 0.0, -1.0])
 
-    for quad, panel_name in zip(mesh.quads, mesh.quad_panels):
-        panel = panels[panel_name]
-        area = _quad_area(mesh, quad)
-        weight = MATERIALS[panel.material].density * loads.gravity * panel.thickness * area
+    for quad, weight in _panel_weights(mesh, structure, loads.gravity):
         _lump_on_nodes(mesh, quad, down * weight, "Dead")
+    for quad, panel_name in zip(mesh.quads, mesh.quad_panels):
         if panel_name.startswith("Roof"):
-            _lump_on_nodes(mesh, quad, down * loads.snow_pressure * area, "Snow")
+            _lump_on_nodes(mesh, quad, down * loads.snow_pressure * _quad_area(mesh, quad), "Snow")
 
     windward = panels[loads.windward_wall]
     inward = _inward_normal(windward, mesh.points.mean(axis=0))
@@ -388,11 +407,58 @@ def apply_loads(mesh: FeMesh, structure: Structure, loads: Loads) -> None:
         _lump_on_nodes(mesh, perimeter, inward * loads.wind_pressure * opening.area, "Wind")
 
     mesh.model.add_member_self_weight("FZ", -loads.gravity, case="Dead")
-    for member in mesh.model.members.values():
-        weight = MATERIALS[member.material.name].density * loads.gravity * member.section.A * member.L()
-        mesh.applied_force += down * weight
+    mesh.applied_force["Dead"] += down * _member_weight(mesh, loads.gravity)
 
     mesh.model.add_load_combo(COMBO, {"Dead": 1.0, "Snow": 1.0, "Wind": 1.0})
+
+
+@dataclass(frozen=True)
+class LateralLoad:
+    """Equivalent static seismic action: the dead mass accelerated along one horizontal axis.
+
+    The house is far stiffer than the corner period of any spectrum here, so it
+    moves as a rigid box and every kilogram sees the same spectral acceleration.
+    """
+
+    name: str
+    axis: int  # 0 = X, 1 = Y
+    acceleration: float  # m/s2
+    level: str = ""  # where the acceleration comes from, e.g. "median" or "SIA II"
+
+    @property
+    def unit_case(self) -> str:
+        return UNIT_INERTIA_CASES[self.axis]
+
+    @property
+    def direction(self) -> np.ndarray:
+        return np.eye(3)[self.axis]
+
+
+UNIT_INERTIA_CASES = ("EQX", "EQY")
+
+
+def apply_unit_inertia(mesh: FeMesh, structure: Structure) -> None:
+    """Load cases EQX and EQY: the dead mass under 1 m/s2 along X and Y, on the nodes free to move.
+
+    Mass lumped on the fixed base nodes goes straight into the ground, exactly
+    as the modal analysis drops it, so an equivalent static combination
+    produces the base shear SA x seismic mass.
+    """
+    free = mesh.free_nodes()
+    for axis, case in enumerate(UNIT_INERTIA_CASES):
+        direction = np.eye(3)[axis]
+        for quad, mass in _panel_weights(mesh, structure, gravity=1.0):
+            moving = [index for index in quad if free[index]]
+            if moving:
+                _lump_on_nodes(mesh, moving, direction * mass * len(moving) / len(quad), case)
+        mesh.model.add_member_self_weight("FX" if axis == 0 else "FY", 1.0, case=case)
+        mesh.applied_force[case] += direction * _member_weight(mesh, gravity=1.0)
+
+
+def add_lateral_combos(mesh: FeMesh, lateral_loads: Iterable[LateralLoad]) -> None:
+    """Dead weight plus the accelerated mass; snow and wind are not combined with the earthquake."""
+    for load in lateral_loads:
+        mesh.model.add_load_combo(load.name, {"Dead": 1.0, load.unit_case: load.acceleration})
 
 
 def von_mises_per_quad(mesh: FeMesh, structure: Structure, combo: str = COMBO) -> np.ndarray:
@@ -413,17 +479,23 @@ def von_mises_per_quad(mesh: FeMesh, structure: Structure, combo: str = COMBO) -
     return stresses
 
 
-def reaction_imbalance(mesh: FeMesh, combo: str = COMBO) -> float:
-    """|sum of reactions + applied loads| relative to the applied loads: ~0 means equilibrium."""
+def total_reaction(mesh: FeMesh, combo: str = COMBO) -> np.ndarray:
     reactions = np.zeros(3)
     for node in mesh.model.nodes.values():
         reactions += [node.RxnFX[combo], node.RxnFY[combo], node.RxnFZ[combo]]
-    return float(np.linalg.norm(reactions + mesh.applied_force) / np.linalg.norm(mesh.applied_force))
+    return reactions
+
+
+def reaction_imbalance(mesh: FeMesh, combo: str = COMBO) -> float:
+    """|sum of reactions + applied loads| relative to the applied loads: ~0 means equilibrium."""
+    applied = mesh.combo_force(combo)
+    return float(np.linalg.norm(total_reaction(mesh, combo) + applied) / np.linalg.norm(applied))
 
 
 @dataclass
 class AnalysisResult:
     case: str
+    combo: str
     structure: Structure
     mesh: FeMesh
     displacements: np.ndarray  # (n_nodes, 3), m
@@ -435,7 +507,12 @@ class AnalysisResult:
     wall_max_von_mises: float  # Pa, in the wall that gets the window
     wall_max_location: tuple[float, float, float]
     corner_von_mises: float  # Pa, within a couple of elements of the window corners
+    reaction: np.ndarray  # (3,), N, sum of the support reactions
     reaction_imbalance: float
+
+    def base_shear(self, axis: int) -> float:
+        """N, the horizontal force the ground has to resist along `axis` (0 = X, 1 = Y)."""
+        return float(abs(self.reaction[axis]))
 
     @property
     def n_quads(self) -> int:
@@ -458,15 +535,14 @@ def stress_near_corners(result_stress: np.ndarray, centres: np.ndarray, openings
     return float(result_stress[distance_to_corner <= radius].max())
 
 
-def analyse(
+def solve(
     model_path: Path,
-    case: str,
     mesh_size: float = 0.2,
     loads: Loads = Loads(),
-    wall_name: str = TARGET_WALL_NAME,
     reference_openings: list[Rect] | None = None,
-) -> AnalysisResult:
-    """Solve one IFC model; `reference_openings` says where to probe a wall that has none."""
+    lateral_loads: Iterable[LateralLoad] = (),
+) -> tuple[Structure, FeMesh]:
+    """Mesh one IFC model, load it and solve every combination in one go."""
     structure = structure_from_ifc(ifcopenshell.open(str(model_path)))
     # Meshing the solid wall with the opening's outline as extra grid lines gives
     # both cases the same mesh, so their results differ only through the opening.
@@ -474,10 +550,25 @@ def analyse(
     mesh = MeshBuilder(structure, mesh_size, reference_corners).build()
     fix_base(mesh)
     apply_loads(mesh, structure, loads)
+    lateral_loads = list(lateral_loads)
+    if lateral_loads:
+        apply_unit_inertia(mesh, structure)
+        add_lateral_combos(mesh, lateral_loads)
     mesh.model.analyze(check_statics=False, sparse=True)
+    return structure, mesh
 
-    displacements = mesh.displacements()
-    von_mises = von_mises_per_quad(mesh, structure)
+
+def result_for_combo(
+    structure: Structure,
+    mesh: FeMesh,
+    case: str,
+    combo: str,
+    mesh_size: float,
+    wall_name: str = TARGET_WALL_NAME,
+    reference_openings: list[Rect] | None = None,
+) -> AnalysisResult:
+    displacements = mesh.displacements(combo)
+    von_mises = von_mises_per_quad(mesh, structure, combo)
     quad_panels = np.array(mesh.quad_panels)
     hottest = int(np.argmax(von_mises))
 
@@ -490,6 +581,7 @@ def analyse(
 
     return AnalysisResult(
         case=case,
+        combo=combo,
         structure=structure,
         mesh=mesh,
         displacements=displacements,
@@ -501,8 +593,98 @@ def analyse(
         wall_max_von_mises=float(von_mises[wall_hottest]),
         wall_max_location=tuple(float(c) for c in centres[wall_hottest]),
         corner_von_mises=corner_stress,
-        reaction_imbalance=reaction_imbalance(mesh),
+        reaction=total_reaction(mesh, combo),
+        reaction_imbalance=reaction_imbalance(mesh, combo),
     )
+
+
+def analyse(
+    model_path: Path,
+    case: str,
+    mesh_size: float = 0.2,
+    loads: Loads = Loads(),
+    wall_name: str = TARGET_WALL_NAME,
+    reference_openings: list[Rect] | None = None,
+) -> AnalysisResult:
+    """Solve one IFC model under the serviceability combination; `reference_openings` says where to probe a wall that has none."""
+    structure, mesh = solve(model_path, mesh_size, loads, reference_openings)
+    return result_for_combo(structure, mesh, case, COMBO, mesh_size, wall_name, reference_openings)
+
+
+def analyse_lateral(
+    model_path: Path,
+    lateral_loads: Iterable[LateralLoad],
+    mesh_size: float = 0.2,
+    loads: Loads = Loads(),
+    wall_name: str = TARGET_WALL_NAME,
+) -> dict[str, AnalysisResult]:
+    """One solve of the model under dead weight plus each equivalent static lateral load."""
+    lateral_loads = list(lateral_loads)
+    structure, mesh = solve(model_path, mesh_size, loads, lateral_loads=lateral_loads)
+    return {load.name: result_for_combo(structure, mesh, load.name, load.name, mesh_size, wall_name) for load in lateral_loads}
+
+
+def lateral_table(results: dict[str, AnalysisResult], lateral_loads: Iterable[LateralLoad]) -> str:
+    header = (
+        f"{'case':<24}{'a [m/s2]':>10}{'base shear [kN]':>17}{'lateral [mm]':>14}"
+        f"{'house vM [MPa]':>16}{'wall vM [MPa]':>15}{'corners [MPa]':>15}  house peak in"
+    )
+    rows = [header, "-" * len(header)]
+    for load in lateral_loads:
+        r = results[load.name]
+        rows.append(
+            f"{r.case:<24}{load.acceleration:>10.3f}{r.base_shear(load.axis) / 1e3:>17.1f}"
+            f"{r.max_lateral_displacement * 1e3:>14.3f}{r.max_von_mises / 1e6:>16.3f}"
+            f"{r.wall_max_von_mises / 1e6:>15.3f}{r.corner_von_mises / 1e6:>15.3f}  {r.max_stress_element}"
+        )
+    rows.append("\nEach case is dead weight plus the seismic mass accelerated along one axis, as a rigid box (no behaviour factor).")
+    return "\n".join(rows)
+
+
+@dataclass(frozen=True)
+class VibrationModes:
+    """Natural periods of the house and how much of its mass each mode moves."""
+
+    periods: np.ndarray  # (n_modes,), s, longest first
+    effective_mass_fraction: np.ndarray  # (n_modes, 3), share of the seismic mass moved along X, Y, Z
+    seismic_mass: float  # kg, mass free to move: dead weight above the fixed base
+
+    def dominant_period(self, axis: int) -> float:
+        """Period of the mode that carries the most mass along `axis` (0 = X, 1 = Y)."""
+        return float(self.periods[np.argmax(self.effective_mass_fraction[:, axis])])
+
+
+def vibration_modes(model_path: Path, mesh_size: float = 0.2, n_modes: int = 12, loads: Loads = Loads()) -> VibrationModes:
+    """Modal analysis of a fresh model: dead load becomes lumped mass at the nodes.
+
+    PyNite's modal solve overwrites the static results, hence the fresh model.
+    The effective modal mass is (phi' M r)^2 / (phi' M phi) for a unit rigid
+    translation r; summed over all modes it would reach the whole seismic mass.
+    """
+    structure = structure_from_ifc(ifcopenshell.open(str(model_path)))
+    mesh = MeshBuilder(structure, mesh_size).build()
+    fix_base(mesh)
+    apply_loads(mesh, structure, loads)
+    model = mesh.model
+    model.add_load_combo("Mass", {"Dead": 1.0})
+    model.analyze_modal(num_modes=n_modes, mass_combo_name="Mass", mass_direction="Z", gravity=loads.gravity)
+
+    mass_matrix = scipy.sparse.csr_matrix(model.M("Mass", "Z", loads.gravity, sparse=True))
+    nodes = [model.nodes[name] for name in mesh.node_names]
+    free = np.array([not node.support_DX for node in nodes])
+    rigid = np.zeros((3, 6 * len(nodes)))
+    for axis in range(3):
+        rigid[axis, axis::6] = free
+    total_mass = rigid @ mass_matrix @ rigid.T
+    seismic_mass = float(total_mass[2, 2])
+
+    fractions = np.empty((len(model.frequencies), 3))
+    for k in range(len(model.frequencies)):
+        combo = f"Mode {k + 1}"
+        shape = np.array([[n.DX[combo], n.DY[combo], n.DZ[combo], n.RX[combo], n.RY[combo], n.RZ[combo]] for n in nodes]).ravel()
+        generalised_mass = shape @ mass_matrix @ shape
+        fractions[k] = (rigid @ mass_matrix @ shape) ** 2 / generalised_mass / np.diag(total_mass)
+    return VibrationModes(1.0 / np.asarray(model.frequencies, dtype=float), fractions, seismic_mass)
 
 
 def summary_table(results: dict[str, AnalysisResult], wall_name: str = TARGET_WALL_NAME) -> str:
