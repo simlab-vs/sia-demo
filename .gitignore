@@ -14,3 +14,5 @@ model/
 output/*
 !output/stress_with_window.gif
 !output/stress_comparison.png
+!output/seismic_spectra.png
+!output/seismic_stress_comparison.png

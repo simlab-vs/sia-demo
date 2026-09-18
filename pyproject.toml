@@ -1,12 +1,13 @@
 [project]
 name = "ifc-fem-demo"
 version = "0.1.0"
-description = "Teaching demo: IFC-based BIM modelling with ifcopenshell, a PyNite shell-and-frame check and VTK renders"
+description = "Teaching demo: IFC-based BIM modelling with ifcopenshell, a PyNite shell-and-frame check, VTK renders and a seismic scenario against SIA 261"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "ifcopenshell>=0.8.5",
     "imageio[ffmpeg]>=2.37.4",
+    "matplotlib>=3.10",
     "pynitefea>=3.2.0",
     "pyvista>=0.49.0",
 ]
