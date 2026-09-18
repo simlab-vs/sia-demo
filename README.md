@@ -1,4 +1,4 @@
-# ifc-fem-demo
+# IFC and FEM demo
 
 A teaching demo that connects **BIM modelling in IFC** with a **structural check** and
 **3D visualisation**, all in Python. It builds a small house as an IFC4 model, cuts a
